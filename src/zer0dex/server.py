@@ -11,9 +11,9 @@ Endpoints:
 Usage:
   python server.py [--port 18420] [--collection my_agent] [--chroma-path ./.mem0_chroma]
 """
+
 import argparse
 import json
-import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from mem0 import Memory
@@ -82,6 +82,9 @@ class Mem0Handler(BaseHTTPRequestHandler):
         if data is None:
             self._send_json({"error": "invalid json"}, 400)
             return
+        if not isinstance(data, dict):
+            self._send_json({"error": "json body must be an object"}, 400)
+            return
 
         if self.path == "/query":
             text = data.get("text", "")
@@ -96,10 +99,12 @@ class Mem0Handler(BaseHTTPRequestHandler):
             for mem in results.get("results", []):
                 score = mem.get("score", 0)
                 if score > min_score:
-                    memories.append({
-                        "text": mem.get("memory", ""),
-                        "score": round(score, 3),
-                    })
+                    memories.append(
+                        {
+                            "text": mem.get("memory", ""),
+                            "score": round(score, 3),
+                        }
+                    )
             self._send_json({"memories": memories})
 
         elif self.path == "/add":
@@ -109,10 +114,12 @@ class Mem0Handler(BaseHTTPRequestHandler):
                 return
             result = self.memory.add(text, user_id=self.user_id)
             extracted = result.get("results", [])
-            self._send_json({
-                "count": len(extracted),
-                "memories": [m.get("memory", "") for m in extracted],
-            })
+            self._send_json(
+                {
+                    "count": len(extracted),
+                    "memories": [m.get("memory", "") for m in extracted],
+                }
+            )
 
         else:
             self._send_json({"error": "not found"}, 404)
@@ -120,14 +127,28 @@ class Mem0Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="zer0dex Memory Server")
-    parser.add_argument("--port", type=int, default=18420, help="Server port (default: 18420)")
-    parser.add_argument("--collection", default="zer0dex", help="ChromaDB collection name")
-    parser.add_argument("--chroma-path", default=".zer0dex", help="ChromaDB storage path")
+    parser.add_argument(
+        "--port", type=int, default=18420, help="Server port (default: 18420)"
+    )
+    parser.add_argument(
+        "--collection", default="zer0dex", help="ChromaDB collection name"
+    )
+    parser.add_argument(
+        "--chroma-path", default=".zer0dex", help="ChromaDB storage path"
+    )
     parser.add_argument("--user-id", default="agent", help="mem0 user ID")
-    parser.add_argument("--llm-model", default="mistral:7b", help="Ollama LLM model for extraction")
-    parser.add_argument("--embed-model", default="nomic-embed-text", help="Ollama embedding model")
-    parser.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
-    parser.add_argument("--min-score", type=float, default=0.3, help="Minimum relevance score")
+    parser.add_argument(
+        "--llm-model", default="mistral:7b", help="Ollama LLM model for extraction"
+    )
+    parser.add_argument(
+        "--embed-model", default="nomic-embed-text", help="Ollama embedding model"
+    )
+    parser.add_argument(
+        "--ollama-url", default="http://localhost:11434", help="Ollama base URL"
+    )
+    parser.add_argument(
+        "--min-score", type=float, default=0.3, help="Minimum relevance score"
+    )
     args = parser.parse_args()
 
     config = build_config(args)

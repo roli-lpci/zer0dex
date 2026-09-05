@@ -1,11 +1,10 @@
 """Tests for zer0dex server — handler logic without requiring mem0/Ollama."""
+
 import json
 import sys
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -28,13 +27,13 @@ def make_handler(method, path, body=None):
     else:
         body_bytes = b""
 
-    raw_request = f"{method} {path} HTTP/1.1\r\nContent-Length: {len(body_bytes)}\r\nContent-Type: application/json\r\n\r\n"
-    request_data = raw_request.encode() + body_bytes
-
     handler = Mem0Handler.__new__(Mem0Handler)
     handler.rfile = BytesIO(body_bytes)
     handler.wfile = BytesIO()
-    handler.headers = {"Content-Length": str(len(body_bytes)), "Content-Type": "application/json"}
+    handler.headers = {
+        "Content-Length": str(len(body_bytes)),
+        "Content-Type": "application/json",
+    }
     handler.path = path
     handler.requestline = f"{method} {path} HTTP/1.1"
     handler.request_version = "HTTP/1.1"
@@ -45,8 +44,6 @@ def make_handler(method, path, body=None):
     handler._response_code = None
     handler._response_headers = {}
     handler._response_body = None
-
-    original_send_json = Mem0Handler._send_json.__get__(handler, Mem0Handler)
 
     def capture_send_json(data, status=200):
         handler._response_code = status
@@ -86,7 +83,9 @@ class TestHealthEndpoint:
     def test_health_returns_ok(self):
         handler = make_handler("GET", "/health")
         mock_memory = MagicMock()
-        mock_memory.get_all.return_value = {"results": [{"memory": "a"}, {"memory": "b"}]}
+        mock_memory.get_all.return_value = {
+            "results": [{"memory": "a"}, {"memory": "b"}]
+        }
         handler.memory = mock_memory
         handler.user_id = "agent"
 
@@ -187,3 +186,17 @@ class TestAddEndpoint:
 
         handler.do_POST()
         assert handler._response_code == 400
+
+    def test_non_object_json_body_returns_400(self):
+        # Valid JSON, but not an object: goes through the real _read_body.
+        handler = make_handler("POST", "/add")
+        handler.headers = {"Content-Length": "2", "Content-Type": "application/json"}
+        handler.rfile = BytesIO(b"[]")
+        handler.path = "/add"
+        handler.memory = MagicMock()
+        handler.user_id = "agent"
+
+        handler.do_POST()
+        assert handler._response_code == 400
+        assert handler._response_body == {"error": "json body must be an object"}
+        handler.memory.add.assert_not_called()
