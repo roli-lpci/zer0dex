@@ -7,14 +7,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from zer0dex import cli
-from zer0dex.cli import load_config, positive_int, save_config, main
+from zer0dex.cli import load_config, positive_int, save_config
 from zer0dex.server import Mem0Handler
 
 
@@ -76,7 +75,7 @@ class TestCLIParsing:
             cwd=str(Path(__file__).resolve().parent.parent),
             env={**__import__("os").environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
         )
-        for cmd in ["check", "init", "seed", "serve", "query", "status", "add"]:
+        for cmd in ["check", "init", "seed", "serve", "stop", "query", "status", "add"]:
             assert cmd in result.stdout, f"Missing command: {cmd}"
 
 
@@ -181,30 +180,121 @@ class TestRuntimePrerequisites:
 
         assert exit_info.value.code == 7
 
-    def test_background_serve_waits_for_readiness(self, monkeypatch, capsys):
+    def test_background_serve_waits_for_readiness(self, tmp_workdir, monkeypatch, capsys):
         process = SimpleNamespace(pid=123, poll=lambda: None)
         monkeypatch.setattr(cli, "require_ollama_client", lambda: True)
         monkeypatch.setattr(cli, "load_config", lambda: {})
         monkeypatch.setattr(cli, "port_is_in_use", lambda port: False)
         monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: process)
-        monkeypatch.setattr(cli, "wait_for_server", lambda port, process: True)
+        monkeypatch.setattr(cli, "wait_for_server", lambda port, process, token: True)
 
         cli.cmd_serve(SimpleNamespace(port=None, background=True))
 
         assert "server started (PID 123, port 18420)" in capsys.readouterr().out
+        state = json.loads((tmp_workdir / ".zer0dex" / "server.json").read_text())
+        assert state["pid"] == 123
+        assert state["port"] == 18420
+        assert state["token"]
 
-    def test_background_serve_fails_when_not_ready(self, monkeypatch):
-        process = SimpleNamespace(pid=123, poll=lambda: None)
+    def test_background_serve_fails_when_not_ready(self, tmp_workdir, monkeypatch):
+        calls = []
+        process = SimpleNamespace(
+            pid=123,
+            poll=lambda: None,
+            terminate=lambda: calls.append("terminate"),
+            wait=lambda timeout=None: calls.append(("wait", timeout)),
+        )
         monkeypatch.setattr(cli, "require_ollama_client", lambda: True)
         monkeypatch.setattr(cli, "load_config", lambda: {})
         monkeypatch.setattr(cli, "port_is_in_use", lambda port: False)
         monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: process)
-        monkeypatch.setattr(cli, "wait_for_server", lambda port, process: False)
+        monkeypatch.setattr(cli, "wait_for_server", lambda port, process, token: False)
 
         with pytest.raises(SystemExit) as exit_info:
             cli.cmd_serve(SimpleNamespace(port=None, background=True))
 
         assert exit_info.value.code == 1
+        assert calls == ["terminate", ("wait", 5)]
+        assert not cli.server_state_file().exists()
+
+    def test_stop_terminates_verified_background_server(self, tmp_workdir, monkeypatch, capsys):
+        cli.save_server_state(123, "launch-token", 18420)
+        checks = iter([True, False, False])
+        signal_calls = []
+        monkeypatch.setattr(cli, "process_is_running", lambda pid: next(checks))
+        monkeypatch.setattr(cli, "is_managed_server_process", lambda state: True)
+        monkeypatch.setattr(cli.os, "kill", lambda pid, sig: signal_calls.append((pid, sig)))
+
+        cli.cmd_stop(SimpleNamespace())
+
+        assert signal_calls == [(123, cli.signal.SIGTERM)]
+        assert not (tmp_workdir / ".zer0dex" / "server.json").exists()
+        assert "server stopped (PID 123)" in capsys.readouterr().out
+
+    def test_stop_cleans_dead_server_state(self, tmp_workdir, monkeypatch, capsys):
+        cli.save_server_state(123, "launch-token", 18420)
+        monkeypatch.setattr(cli, "process_is_running", lambda pid: False)
+
+        cli.cmd_stop(SimpleNamespace())
+
+        assert not (tmp_workdir / ".zer0dex" / "server.json").exists()
+        assert "Removed stale" in capsys.readouterr().out
+
+    def test_stop_refuses_reused_or_unrelated_pid(self, tmp_workdir, monkeypatch, capsys):
+        cli.save_server_state(123, "launch-token", 18420)
+        signal_calls = []
+        monkeypatch.setattr(cli, "process_is_running", lambda pid: True)
+        monkeypatch.setattr(cli, "is_managed_server_process", lambda state: False)
+        monkeypatch.setattr(cli.os, "kill", lambda pid, sig: signal_calls.append((pid, sig)))
+
+        with pytest.raises(SystemExit) as exit_info:
+            cli.cmd_stop(SimpleNamespace())
+
+        assert exit_info.value.code == 1
+        assert signal_calls == []
+        assert (tmp_workdir / ".zer0dex" / "server.json").exists()
+        assert "refusing to signal the recorded PID" in capsys.readouterr().out
+
+    def test_managed_process_identity_requires_server_and_launch_token(self, monkeypatch):
+        state = {"pid": 123, "token": "launch-token", "port": 18420}
+        monkeypatch.setattr(cli, "managed_server_pid", lambda port, token: 123)
+        assert cli.is_managed_server_process(state)
+
+        monkeypatch.setattr(cli, "managed_server_pid", lambda port, token: 456)
+        assert not cli.is_managed_server_process(state)
+
+    def test_server_state_uses_configured_storage_path(self, tmp_workdir):
+        config = {"chroma_path": "custom-memory"}
+
+        cli.save_server_state(123, "launch-token", 18420, config)
+
+        state_file = tmp_workdir / "custom-memory" / "server.json"
+        assert json.loads(state_file.read_text())["pid"] == 123
+        assert state_file.stat().st_mode & 0o777 == 0o600
+        assert not (tmp_workdir / ".zer0dex" / "server.json").exists()
+
+    def test_invalid_server_port_is_stale_state(self, tmp_workdir):
+        state_file = tmp_workdir / ".zer0dex" / "server.json"
+        state_file.parent.mkdir()
+        state_file.write_text(
+            json.dumps({"pid": 123, "token": "launch-token", "port": 70000})
+        )
+
+        assert cli.load_server_state() is None
+
+    def test_boolean_pid_is_stale_state(self, tmp_workdir):
+        state_file = tmp_workdir / ".zer0dex" / "server.json"
+        state_file.parent.mkdir()
+        state_file.write_text(
+            json.dumps({"pid": True, "token": "launch-token", "port": 18420})
+        )
+
+        assert cli.load_server_state() is None
+
+    def test_stop_is_a_successful_noop_when_repeated(self, tmp_workdir, capsys):
+        cli.cmd_stop(SimpleNamespace())
+
+        assert "No managed zer0dex background server is running" in capsys.readouterr().out
 
     def test_background_serve_rejects_an_occupied_port(self, monkeypatch, capsys):
         monkeypatch.setattr(cli, "require_ollama_client", lambda: True)

@@ -33,6 +33,7 @@ store.
 zer0dex init [--collection NAME] [--chroma-path PATH] [--port PORT] [--user-id ID]
 zer0dex seed --source FILE_OR_DIRECTORY [--source MORE] [--dry-run]
 zer0dex serve [--port PORT] [--background]
+zer0dex stop
 zer0dex status [--port PORT]
 zer0dex query TEXT [--limit N] [--port PORT]
 zer0dex add TEXT [--port PORT]
@@ -48,7 +49,16 @@ zer0dex add TEXT [--port PORT]
 - `serve` loads the configured store and starts the loopback HTTP server.
   Foreground mode returns its server exit code. `--background` waits up to 30
   seconds for `/health`; it prints success only after that check passes, and
-  exits 1 (terminating the child) when readiness is not reached.
+  exits 1 (terminating and reaping the child) when readiness is not reached. A
+  background start writes `server.json` in the configured storage directory
+  with a per-launch identity token, and reports success only after the new
+  server proves both its token and PID.
+- `stop` stops the background server recorded by this project. Before sending
+  `SIGTERM`, it asks the loopback server on the recorded port to prove the
+  per-launch token and PID. Missing or dead state is removed safely; an
+  unverifiable, mismatched, or reused PID is never signaled and causes exit 1
+  with state preserved for inspection. Repeating `stop` after a successful
+  stop is a successful no-op.
 - `status`, `query`, and `add` require a running local server. They exit 1
   when it cannot be reached. `query` exits 0 with `No relevant memories found.`
   when the server returns an empty result set. `query --limit` requires a
@@ -72,6 +82,7 @@ zer0dex serve --port 18429 --background
 zer0dex status --port 18429
 zer0dex query 'What reply style is preferred?' --port 18429
 zer0dex add 'The demo service is local-only.' --port 18429
+zer0dex stop
 ```
 
 This is a local implementation pattern, not a guarantee of complete recall or

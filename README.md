@@ -69,11 +69,15 @@ zer0dex serve --background
 zer0dex query "Where does Project Atlas deploy?"
 zer0dex add "Project Atlas deploys from the release branch"
 zer0dex status
+zer0dex stop
 ```
 
 This creates `.zer0dex.json` and a local `.zer0dex/` store in the working
-directory. Stop the background server using your operating system's process
-controls when finished.
+directory. Background starts also record their project-local process state as
+`server.json` in the configured storage directory; use `zer0dex stop` to stop
+that managed server. It will refuse to signal a PID unless the server proves
+its per-launch identity, so stale or reused state cannot stop an unrelated
+process.
 
 ## Integration surface
 

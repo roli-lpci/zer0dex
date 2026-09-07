@@ -28,9 +28,6 @@ def make_handler(method, path, body=None):
     else:
         body_bytes = b""
 
-    raw_request = f"{method} {path} HTTP/1.1\r\nContent-Length: {len(body_bytes)}\r\nContent-Type: application/json\r\n\r\n"
-    request_data = raw_request.encode() + body_bytes
-
     handler = Mem0Handler.__new__(Mem0Handler)
     handler.rfile = BytesIO(body_bytes)
     handler.wfile = BytesIO()
@@ -45,8 +42,6 @@ def make_handler(method, path, body=None):
     handler._response_code = None
     handler._response_headers = {}
     handler._response_body = None
-
-    original_send_json = Mem0Handler._send_json.__get__(handler, Mem0Handler)
 
     def capture_send_json(data, status=200):
         handler._response_code = status
@@ -101,6 +96,28 @@ class TestHealthEndpoint:
     def test_unknown_get_returns_404(self):
         handler = make_handler("GET", "/unknown")
         handler.do_GET()
+        assert handler._response_code == 404
+
+    def test_lifecycle_requires_exact_launch_token(self, monkeypatch):
+        handler = make_handler("GET", "/_lifecycle")
+        handler.instance_token = "launch-token"
+        handler.headers["X-Zer0dex-Instance-Token"] = "launch-token"
+        monkeypatch.setattr("zer0dex.server.os.getpid", lambda: 123)
+
+        handler.do_GET()
+
+        assert handler._response_code == 200
+        assert handler._response_body == {"pid": 123}
+
+    @pytest.mark.parametrize("token", ["", "wrong-token"])
+    def test_lifecycle_rejects_missing_or_wrong_token(self, token):
+        handler = make_handler("GET", "/_lifecycle")
+        handler.instance_token = "launch-token"
+        if token:
+            handler.headers["X-Zer0dex-Instance-Token"] = token
+
+        handler.do_GET()
+
         assert handler._response_code == 404
 
 

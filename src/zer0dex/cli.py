@@ -6,15 +6,20 @@ Commands:
   zer0dex init     Initialize a new zer0dex memory store
   zer0dex seed     Seed vector store from markdown files
   zer0dex serve    Start the memory server
+  zer0dex stop     Stop this project's managed background server
   zer0dex query    Query memories from the command line
   zer0dex status   Check server health and memory count
   zer0dex add      Add a memory manually
 """
 import argparse
 import json
+import os
+import secrets
+import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -62,8 +67,8 @@ def port_is_in_use(port):
         return False
 
 
-def wait_for_server(port, process, timeout_seconds=30):
-    """Wait for a background server to answer health checks before reporting it ready."""
+def wait_for_server(port, process, token=None, timeout_seconds=30):
+    """Wait for the spawned server to answer health and identity checks."""
     url = f"http://127.0.0.1:{port}/health"
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -73,15 +78,125 @@ def wait_for_server(port, process, timeout_seconds=30):
         try:
             response = urllib.request.urlopen(url, timeout=1)
             payload = json.loads(response.read())
-            if payload.get("status") == "ok":
+            if payload.get("status") == "ok" and (
+                token is None or managed_server_pid(port, token) == process.pid
+            ):
                 return True
-        except (urllib.error.URLError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError):
             pass
         time.sleep(0.2)
 
-    process.terminate()
     print(f"Error: zer0dex server did not become ready within {timeout_seconds} seconds.")
     return False
+
+
+def server_state_file(config=None):
+    """Return the lifecycle state path for this project's configured store."""
+    config = load_config() if config is None else config
+    return Path(config.get("chroma_path", DEFAULT_CHROMA_PATH)) / "server.json"
+
+
+def load_server_state(config=None):
+    """Return the background-server state, or None when it is absent or invalid."""
+    state_file = server_state_file(config)
+    try:
+        state = json.loads(state_file.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    if (
+        not isinstance(state.get("pid"), int)
+        or isinstance(state["pid"], bool)
+        or state["pid"] < 1
+    ):
+        return None
+    if not isinstance(state.get("token"), str) or not state["token"]:
+        return None
+    if (
+        not isinstance(state.get("port"), int)
+        or isinstance(state["port"], bool)
+        or not 1 <= state["port"] <= 65535
+    ):
+        return None
+    return state
+
+
+def save_server_state(pid, token, port, config=None):
+    """Record the exact background child that this project started."""
+    state_file = server_state_file(config)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=state_file.parent,
+            prefix=f".{state_file.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(
+                json.dumps({"pid": pid, "token": token, "port": port}) + "\n"
+            )
+            temporary = Path(handle.name)
+        temporary.replace(state_file)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def clear_server_state(config=None):
+    """Remove a stale local server record without touching any process."""
+    try:
+        server_state_file(config).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def managed_server_pid(port, token):
+    """Return the PID from a background server that proves the launch token."""
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/_lifecycle",
+        headers={"X-Zer0dex-Instance-Token": token},
+    )
+    try:
+        response = urllib.request.urlopen(request, timeout=1)
+        payload = json.loads(response.read())
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        return None
+    pid = payload.get("pid") if isinstance(payload, dict) else None
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+def is_managed_server_process(state):
+    """Confirm PID ownership through the server's per-launch token handshake."""
+    return managed_server_pid(state["port"], state["token"]) == state["pid"]
+
+
+def process_is_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_spawned_process(process):
+    """Stop and reap a child that failed background startup."""
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def load_config():
@@ -111,11 +226,11 @@ def cmd_init(args):
     save_config(config)
     Path(config["chroma_path"]).mkdir(parents=True, exist_ok=True)
 
-    print(f"✅ zer0dex initialized")
+    print("✅ zer0dex initialized")
     print(f"   Collection: {config['collection']}")
     print(f"   Storage: {config['chroma_path']}")
     print(f"   Config: {CONFIG_FILE}")
-    print(f"\nNext: zer0dex seed --source your-docs/")
+    print("\nNext: zer0dex seed --source your-docs/")
 
 
 def cmd_seed(args):
@@ -156,7 +271,7 @@ def cmd_seed(args):
         "vector_store": {"provider": "chroma", "config": {"collection_name": config.get("collection", DEFAULT_COLLECTION), "path": config.get("chroma_path", DEFAULT_CHROMA_PATH)}},
     }
 
-    print(f"\nLoading mem0...")
+    print("\nLoading mem0...")
     memory = Memory.from_config(mem_config)
     user_id = config.get("user_id", DEFAULT_USER_ID)
 
@@ -251,17 +366,103 @@ def cmd_serve(args):
     ]
 
     if args.background:
+        state_file = server_state_file(config)
+        state = load_server_state(config)
+        if state is not None:
+            if process_is_running(state["pid"]):
+                if is_managed_server_process(state):
+                    print(
+                        "Error: a managed zer0dex background server is already "
+                        "running; use zer0dex stop first."
+                    )
+                else:
+                    print(
+                        "Error: the recorded background PID is running but its "
+                        "identity cannot be verified; refusing to replace its state."
+                    )
+                sys.exit(1)
+            clear_server_state(config)
+        elif state_file.exists():
+            clear_server_state(config)
         if port_is_in_use(port):
             print(f"Error: port {port} is already in use; no server was started.")
             sys.exit(1)
-        proc = subprocess.Popen(server_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not wait_for_server(port, proc):
+        token = secrets.token_urlsafe(24)
+        proc = subprocess.Popen(
+            server_args + ["--instance-token", token],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            save_server_state(proc.pid, token, port, config)
+        except OSError as exc:
+            terminate_spawned_process(proc)
+            print(f"Error: could not record background server state: {exc}")
+            sys.exit(1)
+        try:
+            ready = wait_for_server(port, proc, token)
+        except BaseException:
+            terminate_spawned_process(proc)
+            clear_server_state(config)
+            raise
+        if not ready:
+            terminate_spawned_process(proc)
+            clear_server_state(config)
             sys.exit(1)
         print(f"✅ zer0dex server started (PID {proc.pid}, port {port})")
     else:
         result = subprocess.run(server_args)
         if result.returncode:
             sys.exit(result.returncode)
+
+
+def cmd_stop(args):
+    """Stop the background server started by this project, if it still matches state."""
+    config = load_config()
+    state_file = server_state_file(config)
+    state = load_server_state(config)
+    if state is None:
+        if state_file.exists():
+            clear_server_state(config)
+            print("Removed invalid stale zer0dex background server state.")
+            return
+        print("No managed zer0dex background server is running.")
+        return
+
+    pid = state["pid"]
+    if not process_is_running(pid):
+        clear_server_state(config)
+        print("Removed stale zer0dex background server state.")
+        return
+
+    if not is_managed_server_process(state):
+        print(
+            "Error: refusing to signal the recorded PID because the server identity "
+            "could not be verified; state was kept for inspection."
+        )
+        sys.exit(1)
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        clear_server_state(config)
+        print("Removed stale zer0dex background server state.")
+        return
+    except PermissionError:
+        print(f"Error: permission denied while stopping zer0dex server PID {pid}; state was kept.")
+        sys.exit(1)
+    except OSError as exc:
+        print(f"Error: could not stop zer0dex server PID {pid}: {exc}; state was kept.")
+        sys.exit(1)
+    deadline = time.monotonic() + 5
+    while process_is_running(pid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if process_is_running(pid):
+        print(f"Error: zer0dex server PID {pid} did not stop; state was kept.")
+        sys.exit(1)
+
+    clear_server_state(config)
+    print(f"✅ zer0dex server stopped (PID {pid}).")
 
 
 def cmd_query(args):
@@ -354,6 +555,9 @@ def main():
     p_serve.add_argument("--port", type=int, help="Server port")
     p_serve.add_argument("--background", "-b", action="store_true", help="Run in background")
 
+    # stop
+    sub.add_parser("stop", help="Stop the project-managed background server")
+
     # query
     p_query = sub.add_parser("query", help="Query memories")
     p_query.add_argument("text", help="Query text")
@@ -379,6 +583,7 @@ def main():
         "init": cmd_init,
         "seed": cmd_seed,
         "serve": cmd_serve,
+        "stop": cmd_stop,
         "query": cmd_query,
         "status": cmd_status,
         "add": cmd_add,
