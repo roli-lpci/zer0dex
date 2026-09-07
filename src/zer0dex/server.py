@@ -14,6 +14,8 @@ Usage:
 import argparse
 import json
 from numbers import Real
+import os
+import secrets
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -55,6 +57,7 @@ class Mem0Handler(BaseHTTPRequestHandler):
     memory = None
     user_id = None
     min_score = 0.3
+    instance_token = None
 
     def log_message(self, format, *args):
         pass  # suppress request logging
@@ -80,6 +83,14 @@ class Mem0Handler(BaseHTTPRequestHandler):
             all_mem = get_all_for_user(self.memory, self.user_id)
             count = len(all_mem.get("results", []))
             self._send_json({"status": "ok", "count": count})
+        elif self.path == "/_lifecycle":
+            token = self.headers.get("X-Zer0dex-Instance-Token", "")
+            if not self.instance_token or not secrets.compare_digest(
+                token, self.instance_token
+            ):
+                self._send_json({"error": "not found"}, 404)
+                return
+            self._send_json({"pid": os.getpid()})
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -143,6 +154,7 @@ def main():
     parser.add_argument("--embed-model", default="nomic-embed-text", help="Ollama embedding model")
     parser.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
     parser.add_argument("--min-score", type=float, default=0.3, help="Minimum relevance score")
+    parser.add_argument("--instance-token", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if Memory is None:
@@ -173,6 +185,7 @@ def main():
     Mem0Handler.memory = memory
     Mem0Handler.user_id = args.user_id
     Mem0Handler.min_score = args.min_score
+    Mem0Handler.instance_token = args.instance_token
 
     server = HTTPServer(("127.0.0.1", args.port), Mem0Handler)
     try:

@@ -7,7 +7,6 @@ Usage:
   python seed.py --source MEMORY.md --source memory/ [--collection my_agent] [--chroma-path ./.mem0_chroma]
 """
 import argparse
-import os
 import sys
 from pathlib import Path
 
